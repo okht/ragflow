@@ -1,0 +1,81 @@
+name: Validate Agent model inputs
+
+on:
+  push:
+    branches:
+      - codex/ragflow-model-input-validation
+
+permissions:
+  contents: read
+
+jobs:
+  go-model-inputs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      RAGFLOW_BUILD_IMAGE: infiniflow/github_action_runner:latest@sha256:c59dc1e4584ab0a261e827b9f2910d0944c29d62d11076300c607208bd56317e
+    steps:
+      - name: Check out validation branch
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Inspect disk and pull the official build environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            df -h "$GITHUB_WORKSPACE"
+            docker system df
+            docker pull "$RAGFLOW_BUILD_IMAGE"
+            docker image inspect --format 'Image size in bytes: {{.Size}}' "$RAGFLOW_BUILD_IMAGE"
+            df -h "$GITHUB_WORKSPACE"
+          } 2>&1 | tee "$RUNNER_TEMP/ragflow-model-input-environment.log"
+
+      - name: Build tokenizer and run Go package tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The repository Dockerfile uses this image for its go-builder stage.
+          # No host credentials, GitHub tokens, or Docker socket enter the container.
+          docker run --rm -i --user 0:0 --entrypoint /bin/bash \
+            -e GOPROXY=https://proxy.golang.org,direct \
+            -e GOPRIVATE=github.com/infiniflow/onnxruntime_go \
+            -e GOTOOLCHAIN=auto \
+            -v "$GITHUB_WORKSPACE:/ragflow" \
+            -w /ragflow \
+            "$RAGFLOW_BUILD_IMAGE" -s <<'SCRIPT' 2>&1 | tee "$RUNNER_TEMP/ragflow-model-input-tests.log"
+          set -euo pipefail
+          git config --global --add safe.directory /ragflow
+          for tool in go clang++ cmake ld.lld make nm objcopy; do
+            command -v "$tool"
+          done
+          go version
+          go env GOOS GOARCH
+          clang++ --version
+          cmake --version
+          ld.lld --version
+          for library in office_oxide pdfium-static pdf_oxide onnxruntime/static_lib; do
+            path="/opt/ragflow-native-libs/$library"
+            if [ ! -d "$path" ]; then
+              echo "Missing official image prerequisite: $path" >&2
+              exit 1
+            fi
+          done
+          # build.sh validates native versions and provisions the BPE table.
+          # Unit tests do not request the model-backed integration/e2e tiers.
+          bash build.sh --check-ort-version
+          bash build.sh --cpp
+          bash build.sh --test ./internal/entity/models/... ./internal/handler/...
+          SCRIPT
+
+      - name: Upload validation logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ragflow-model-input-validation-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/ragflow-model-input-environment.log
+            ${{ runner.temp }}/ragflow-model-input-tests.log
+          if-no-files-found: warn
+          retention-days: 7
